@@ -1,0 +1,11 @@
+{
+  "rules": {
+    "lecturas": {
+      ".read": true,
+      ".write": false,
+      "$lectura": {
+        ".validate": "newData.hasChildren(['timestamp']) && newData.child('timestamp').isNumber()"
+      }
+    }
+  }
+}
