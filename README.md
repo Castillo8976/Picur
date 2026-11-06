@@ -1,19 +1,30 @@
-# PICUR · Monitor de ladera
+# PICUR Monitor · Flutter
 
-Aplicación web estática en HTML, CSS y JavaScript para consultar lecturas de humedad desde Firebase Realtime Database. La aplicación **solo lee y visualiza** datos de sensores; la escritura la realiza el ESP32.
+Aplicación móvil nativa para Android e iOS. Consulta lecturas de humedad desde Firebase Realtime Database; no escribe datos de sensores. Incluye dashboard, estado sin señal después de 30 segundos, historial, alertas, umbrales locales, modo oscuro y modo demo.
 
-## Instalación y configuración
+## Requisitos
 
-1. Copia el proyecto o clónalo.
-2. En [js/config.js](./js/config.js), reemplaza los valores `REEMPLAZAR_*` por la configuración de una app web de Firebase. Esta configuración identifica el proyecto, no contiene una contraseña privada.
-3. En Firebase Realtime Database, crea el nodo `lecturas`. El navegador se suscribe a ese nodo mediante `onValue`.
-4. Publica los archivos como sitio estático. No se requiere `npm install` ni proceso de build.
+- Flutter 3.22 o superior
+- Android Studio y/o Xcode
+- Un proyecto Firebase propio
 
-Para desarrollo local, sirve la carpeta con cualquier servidor HTTP (por ejemplo, la extensión Live Server). Los módulos ES y el import dinámico del SDK no funcionan correctamente con `file://`.
+El SDK de Flutter no estaba instalado al preparar este repositorio, así que las carpetas generadas específicas de plataforma se crean localmente con Flutter.
 
-## Formato enviado por ESP32
+## Preparar el proyecto
 
-Cada lectura debe estar en `lecturas/{id}`:
+```bash
+flutter create .
+flutter pub get
+dart pub global activate flutterfire_cli
+flutterfire configure
+flutter run
+```
+
+Selecciona el proyecto Firebase y las plataformas Android/iOS. El comando `flutterfire configure` reemplazará `lib/firebase_options.dart` con la configuración pública de tu propio proyecto. No se vincula ninguna cuenta Gmail automáticamente.
+
+## Base de datos y ESP32
+
+El ESP32 escribe en `lecturas/{id}`:
 
 ```json
 {
@@ -25,25 +36,12 @@ Cada lectura debe estar en `lecturas/{id}`:
 }
 ```
 
-`timestamp` es epoch en milisegundos. `humedad_raw`, `estado` y `u_kpa` son opcionales. Si falta `estado`, el navegador lo calcula con los umbrales guardados localmente. Si falta `humedad_pct` pero existe `humedad_raw`, se utiliza la calibración local.
+La app se suscribe con `FirebaseDatabase.instance.ref('lecturas').onValue`. Si hay una lectura malformada, se ignora esa lectura y se conservan las válidas. Las reglas iniciales están en `firebase.rules.json`; en producción usa Firebase Authentication y restringe las lecturas a usuarios autenticados.
 
-## Reglas de seguridad
+## Configuración modular
 
-Para una demo pública de solo lectura puede usarse el contenido de [firebase.rules.json](./firebase.rules.json). Antes de producción, no se recomienda dejar `.read: true`: usa Firebase Authentication y reglas que permitan leer solo a usuarios autenticados. El ESP32 debe escribir con credenciales o un mecanismo de servidor seguro; nunca expongas una clave privada en el frontend.
+Las métricas están en `lib/config.dart`. Para activar presión de poros cuando el ESP32 envíe `u_kpa`, cambia `active: false` a `active: true` en la métrica correspondiente y ajusta la interfaz si quieres mostrar su tarjeta dedicada.
 
-## GitHub Pages
+## Uso sin hardware
 
-En GitHub: **Settings → Pages → Deploy from a branch**, selecciona `main` y la carpeta `/ (root)`. `index.html` es el punto de entrada. Si el repositorio se sirve bajo una subruta, las rutas relativas de esta aplicación continúan funcionando.
-
-## Funcionalidades
-
-- Suscripción en tiempo real, indicador de señal después de 30 segundos sin lectura y manejo de base vacía.
-- Dashboard, gráfica Chart.js con rangos de 1 h, 6 h, 24 h y todo.
-- Umbrales de prealerta/alerta, modo oscuro, alertas visuales y vibración en dispositivos compatibles.
-- Historial filtrable por fecha/estado, paginado y exportable a CSV.
-- Calibración RAW seco/saturado, almacenada solo en `localStorage`.
-- Modo demo para probar la interfaz sin hardware.
-
-## Activar presión de poros
-
-La arquitectura de métricas está en `METRICS` dentro de [js/config.js](./js/config.js). Cuando el ESP32 comience a enviar `u_kpa`, cambia `active: false` a `active: true` en la métrica `porePressure` y ajusta sus umbrales. El dashboard incorporará la tarjeta automáticamente sin cambiar `db.js` ni la estructura de la UI.
+Desde el menú lateral activa **Modo demo**. Genera humedad progresiva para probar los estados de prealerta y alerta sin escribir nada en Firebase.
