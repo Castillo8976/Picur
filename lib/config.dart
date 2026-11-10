@@ -1,25 +1,15 @@
-class MetricConfig {
-  const MetricConfig({
-    required this.id,
-    required this.name,
-    required this.field,
-    required this.unit,
-    required this.active,
-  });
-  final String id;
-  final String name;
-  final String field;
-  final String unit;
-  final bool active;
-}
+import 'models/metric_config.dart';
 
-const metrics = [
+const defaultMetrics = [
   MetricConfig(
     id: 'humidity',
     name: 'Humedad del suelo',
     field: 'humedad_pct',
     unit: '%',
     active: true,
+    prealert: 60,
+    alert: 75,
+    colorValue: 0xff147d5a,
   ),
   MetricConfig(
     id: 'pressure',
@@ -27,9 +17,10 @@ const metrics = [
     field: 'u_kpa',
     unit: 'kPa',
     active: false,
+    prealert: 10,
+    alert: 20,
+    colorValue: 0xff1769aa,
   ),
 ];
 
-const databasePath = 'lecturas';
-const defaultPrealert = 60.0;
-const defaultAlert = 75.0;
+const defaultConnectionId = 'demo';

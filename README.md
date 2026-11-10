@@ -1,47 +1,79 @@
-# PICUR Monitor · Flutter
+# PICUR Monitor
 
-Aplicación móvil nativa para Android e iOS. Consulta lecturas de humedad desde Firebase Realtime Database; no escribe datos de sensores. Incluye dashboard, estado sin señal después de 30 segundos, historial, alertas, umbrales locales, modo oscuro y modo demo.
+Visor Flutter reutilizable para datos IoT. La aplicación solo lee datos: no escribe
+lecturas en Firebase, MQTT ni APIs REST.
 
-## Requisitos
+## Requisitos e instalación
 
-- Flutter 3.22 o superior
-- Android Studio y/o Xcode
-- Un proyecto Firebase propio
-
-El SDK de Flutter no estaba instalado al preparar este repositorio, así que las carpetas generadas específicas de plataforma se crean localmente con Flutter.
-
-## Preparar el proyecto
+- Flutter estable con Dart 3.3 o superior.
+- Android Studio para Android; Xcode para iOS.
 
 ```bash
-flutter create .
 flutter pub get
-dart pub global activate flutterfire_cli
-flutterfire configure
 flutter run
+flutter build apk --release
 ```
 
-Selecciona el proyecto Firebase y las plataformas Android/iOS. El comando `flutterfire configure` reemplazará `lib/firebase_options.dart` con la configuración pública de tu propio proyecto. No se vincula ninguna cuenta Gmail automáticamente.
+La app no necesita `google-services.json`: Firebase Realtime Database se consume
+por REST. En Android se declara `INTERNET` y `POST_NOTIFICATIONS` en
+`android/app/src/main/AndroidManifest.xml`.
 
-## Base de datos y ESP32
+## Configuración desde la app
 
-El ESP32 escribe en `lecturas/{id}`:
+1. Abre **Conexiones** y crea un perfil.
+2. Selecciona **Firebase REST**, **API REST genérica** o **MQTT**.
+3. Prueba la conexión y selecciona el perfil activo.
+4. En **Sensores / Métricas**, activa o crea métricas y asigna sus campos JSON,
+   unidad, campo de tiempo, umbrales y dirección de alerta.
+
+Los perfiles y métricas se guardan localmente. Las claves y contraseñas usan
+`flutter_secure_storage`; el resto de la configuración usa `shared_preferences`.
+El modelo `ConnectionProfile` permite exportar/importar JSON sin incluir secretos.
+
+### Firebase Realtime Database REST
+
+- `databaseURL`: por ejemplo `https://proyecto-default-rtdb.firebaseio.com`
+- Ruta: `lecturas`
+- La app consulta `lecturas.json` periódicamente y acepta un token Bearer.
+- Un nodo puede ser un objeto indexado por id o una lista de objetos.
+
+### API REST genérica
+
+La respuesta debe ser un objeto JSON o una lista de objetos. Ejemplo:
 
 ```json
-{
-  "timestamp": 1730851200000,
-  "humedad_pct": 41.5,
-  "humedad_raw": 512,
-  "estado": "Normal",
-  "u_kpa": null
-}
+[
+  {"id":"a1","timestamp":1730851200000,"humedad_pct":41.5},
+  {"id":"a2","timestamp":"2026-11-10T15:00:00Z","humedad_pct":43.1}
+]
 ```
 
-La app se suscribe con `FirebaseDatabase.instance.ref('lecturas').onValue`. Si hay una lectura malformada, se ignora esa lectura y se conservan las válidas. Las reglas iniciales están en `firebase.rules.json`; en producción usa Firebase Authentication y restringe las lecturas a usuarios autenticados.
+Para MySQL/MariaDB se recomienda un backend propio de solo lectura que exponga
+este JSON. Se soportan epoch en segundos o milisegundos e ISO 8601.
 
-## Configuración modular
+### MQTT
 
-Las métricas están en `lib/config.dart`. Para activar presión de poros cuando el ESP32 envíe `u_kpa`, cambia `active: false` a `active: true` en la métrica correspondiente y ajusta la interfaz si quieres mostrar su tarjeta dedicada.
+Configura broker, puerto, TLS y topic. Cada mensaje del topic debe ser JSON con
+los campos definidos en **Sensores / Métricas**. MQTT no ofrece historial por sí
+mismo; el historial mostrado corresponde a los mensajes recibidos durante la
+sesión.
 
-## Uso sin hardware
+## PICUR y presión de poros
 
-Desde el menú lateral activa **Modo demo**. Genera humedad progresiva para probar los estados de prealerta y alerta sin escribir nada en Firebase.
+La plantilla **Humedad del suelo (PICUR)** usa `humedad_pct` y `timestamp`.
+**Presión de poros (kPa)** usa `u_kpa`, está desactivada inicialmente y puede
+activarse desde la interfaz. Para obtener altura equivalente de agua:
+
+`h (m) = u (kPa) / 9.81`
+
+La calibración raw → porcentaje admite dos puntos seco/saturado. Una métrica sin
+valor se presenta como **Sensor no conectado**, no como error.
+
+## Funciones
+
+Dashboard en tiempo real, estado global Normal/Prealerta/Alerta/Sin señal,
+gráficas con umbrales y zoom táctil de `fl_chart`, historial exportable a CSV,
+registro de alertas, perfiles reutilizables, tema claro/oscuro y modo demo.
+
+El analizador tolera lecturas inválidas, campos faltantes y respuestas vacías;
+las lecturas válidas permanecen visibles.

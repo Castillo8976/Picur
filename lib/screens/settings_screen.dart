@@ -34,7 +34,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
       if (message.isNotEmpty) Text(message, style: const TextStyle(color: Colors.green)),
     ]))),
     const SizedBox(height: 18),
-    Card(child: const ListTile(
+    const Card(child: ListTile(
       leading: Icon(Icons.sensors),
       title: Text('Presión de poros'),
       subtitle: Text('Sensor no conectado · activar en lib/config.dart cuando haya datos u_kpa'),
