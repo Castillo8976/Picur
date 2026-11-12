@@ -7,6 +7,8 @@ class ReadingParser {
 
   List<Reading> parse(dynamic payload) {
     final entries = <Map<String, dynamic>>[];
+    // Firebase responde "null" cuando el nodo todavía no existe.
+    if (payload == null) return [];
     if (payload is List) {
       entries.addAll(payload.whereType<Map>().map(_map));
     } else if (payload is Map) {

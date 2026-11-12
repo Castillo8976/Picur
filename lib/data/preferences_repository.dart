@@ -6,7 +6,9 @@ import '../models/metric_config.dart';
 
 class PreferencesRepository {
   static const profilesKey = 'picur.connection_profiles';
-  static const metricsKey = 'picur.metrics';
+  // v2: incluye presión, nivel e inclinación activas. Evita reutilizar
+  // métricas antiguas guardadas en el teléfono.
+  static const metricsKey = 'picur.metrics.v2';
   static const activeKey = 'picur.active_connection';
   static const themeKey = 'picur.dark_theme';
   static const intervalKey = 'picur.no_signal_seconds';
@@ -14,14 +16,21 @@ class PreferencesRepository {
   Future<List<ConnectionProfile>> profiles() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(profilesKey);
-    if (raw == null) return const [];
-    try {
-      return (jsonDecode(raw) as List)
-          .map((item) => ConnectionProfile.fromJson(Map<String, dynamic>.from(item as Map)))
-          .toList();
-    } catch (_) {
-      return const [];
+    var stored = <ConnectionProfile>[];
+    if (raw != null) {
+      try {
+        stored = (jsonDecode(raw) as List)
+            .map((item) => ConnectionProfile.fromJson(Map<String, dynamic>.from(item as Map)))
+            .toList();
+      } catch (_) {
+        stored = [];
+      }
     }
+    // El perfil de Firebase del proyecto siempre está disponible y siempre
+    // usa la URL de lib/config.dart (si cambias la URL, se actualiza solo).
+    stored.removeWhere((p) => p.id == defaultConnectionId);
+    stored.insert(0, defaultFirebaseProfile);
+    return stored;
   }
 
   Future<void> saveProfiles(List<ConnectionProfile> profiles) async {
@@ -30,7 +39,7 @@ class PreferencesRepository {
   }
 
   Future<String?> activeConnection() async =>
-      (await SharedPreferences.getInstance()).getString(activeKey);
+      (await SharedPreferences.getInstance()).getString(activeKey) ?? defaultConnectionId;
 
   Future<void> setActiveConnection(String id) async =>
       (await SharedPreferences.getInstance()).setString(activeKey, id);
@@ -38,13 +47,13 @@ class PreferencesRepository {
   Future<List<MetricConfig>> metrics() async {
     final prefs = await SharedPreferences.getInstance();
     final raw = prefs.getString(metricsKey);
-    if (raw == null) return defaultMetrics;
+    if (raw == null) return [...defaultMetrics];
     try {
       return (jsonDecode(raw) as List)
           .map((item) => MetricConfig.fromJson(Map<String, dynamic>.from(item as Map)))
           .toList();
     } catch (_) {
-      return defaultMetrics;
+      return [...defaultMetrics];
     }
   }
 

@@ -30,7 +30,7 @@ class MqttDataSource implements DataSource {
     client.keepAlivePeriod = 30;
     client.logging(on: false);
     final password = await _credentials.read(profile.passwordKey);
-    client.connect(profile.username, password);
+    await client.connect(profile.username, password);
     if (client.connectionStatus?.state != MqttConnectionState.connected) {
       throw Exception('No fue posible conectar al broker MQTT.');
     }

@@ -9,6 +9,7 @@ import '../config.dart';
 import '../data/datasource_factory.dart';
 import '../data/preferences_repository.dart';
 import '../domain/data_source.dart';
+import '../domain/simulation.dart';
 import '../models/connection_profile.dart';
 import '../models/metric_config.dart';
 import '../models/reading.dart';
@@ -26,13 +27,14 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   final repository = PreferencesRepository();
   final readings = <Reading>[];
-  List<MetricConfig> metrics = defaultMetrics;
+  List<MetricConfig> metrics = [...defaultMetrics];
   List<ConnectionProfile> profiles = [];
   DataSource? source;
   StreamSubscription<List<Reading>>? subscription;
   int page = 0;
   bool demo = false;
   Timer? demoTimer;
+  Timer? uiTimer;
   String? activeId;
   String message = '';
   DateTime? lastData;
@@ -46,6 +48,10 @@ class _HomeScreenState extends State<HomeScreen> {
     super.initState();
     notifications.initialize();
     _load();
+    // Repinta cada 5 s para detectar "Sin señal" aunque no lleguen datos.
+    uiTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+      if (mounted) setState(() {});
+    });
   }
 
   Future<void> _load() async {
@@ -69,21 +75,20 @@ class _HomeScreenState extends State<HomeScreen> {
     setState(() => message = 'Conectando con ${profile.name}...');
     source = next;
     subscription = next.streamLecturas().listen((items) {
-      if (!mounted) return;
+      if (!mounted || demo) return;
+      // Firebase se consulta cada pocos segundos y devuelve la misma lectura
+      // hasta que el ESP32 la actualiza: solo se agregan lecturas nuevas.
+      final newest = readings.lastOrNull?.timestamp;
+      final fresh = items.where((r) => newest == null || r.timestamp.isAfter(newest)).toList();
       setState(() {
-        readings.addAll(items);
+        message = '';
+        if (fresh.isEmpty) return;
+        readings.addAll(fresh);
         readings.sort((a, b) => a.timestamp.compareTo(b.timestamp));
         if (readings.length > 1000) readings.removeRange(0, readings.length - 1000);
         lastData = DateTime.now();
-        message = '';
       });
-      final nextState = globalState;
-      if (nextState != AlertState.normal &&
-          nextState != AlertState.sinSenal &&
-          nextState != notifiedState) {
-        notifiedState = nextState;
-        notifications.alert(nextState.label);
-      }
+      if (fresh.isNotEmpty) _notifyIfNeeded();
     }, onError: (Object error) {
       if (mounted) setState(() => message = 'Error de conexión: $error');
     });
@@ -92,17 +97,30 @@ class _HomeScreenState extends State<HomeScreen> {
   void toggleDemo() {
     if (demo) {
       demoTimer?.cancel();
-      setState(() => demo = false);
+      setState(() {
+        demo = false;
+        // Se quitan las lecturas de la demo para volver a los datos reales.
+        readings.removeWhere((r) => r.id.startsWith('demo-'));
+        lastData = readings.isEmpty ? null : DateTime.now();
+      });
       return;
     }
-    var humidity = readings.lastOrNull?.values['humidity'] ?? 42;
+    // Simula un suelo que se va saturando (0 % -> 100 %) y vuelve a empezar.
+    double humidity = readings.lastOrNull?.values['humidity'] ?? 0.0;
     void tick() {
-      humidity = (humidity + (humidity > 72 ? 1.4 : .25)).clamp(0, 96).toDouble();
+      humidity = humidity >= 100 ? 0.0 : (humidity + 4).clamp(0, 100).toDouble();
+      final sim = simularDesdeHumedad(humidity);
       final now = DateTime.now();
       setState(() {
-        readings.add(Reading(id: 'demo-${now.microsecondsSinceEpoch}', timestamp: now, values: {'humidity': humidity}));
+        readings.add(Reading(
+          id: 'demo-${now.microsecondsSinceEpoch}',
+          timestamp: now,
+          values: sim.values,
+          raw: {'estado_codigo': sim.estado.index},
+        ));
         lastData = now;
       });
+      _notifyIfNeeded();
     }
     tick();
     demoTimer = Timer.periodic(const Duration(seconds: 3), (_) => tick());
@@ -112,6 +130,7 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void dispose() {
     demoTimer?.cancel();
+    uiTimer?.cancel();
     subscription?.cancel();
     source?.dispose();
     super.dispose();
@@ -163,10 +182,27 @@ class _HomeScreenState extends State<HomeScreen> {
   List<MetricConfig> get activeMetrics => metrics.where((m) => m.active).toList();
   Reading? latestFor(String id) => readings.lastWhereOrNull((r) => r.values[id] != null);
   AlertState stateForMetric(MetricConfig metric, Reading? reading) {
-    if (reading == null || lastData == null || DateTime.now().difference(lastData!).inSeconds > 30) return AlertState.sinSenal;
+    if (reading == null || _signalLost) return AlertState.sinSenal;
     return stateFor(reading.values[metric.id]!, metric.prealert, metric.alert, rises: metric.rises);
   }
+  void _notifyIfNeeded() {
+    final nextState = globalState;
+    if (nextState == AlertState.normal) notifiedState = null;
+    if (nextState != AlertState.normal &&
+        nextState != AlertState.sinSenal &&
+        nextState != notifiedState) {
+      notifiedState = nextState;
+      notifications.alert(nextState.label);
+    }
+  }
+
+  bool get _signalLost => lastData == null || DateTime.now().difference(lastData!).inSeconds > 30;
+
   AlertState get globalState {
+    final latest = readings.lastOrNull;
+    if (latest == null || _signalLost) return AlertState.sinSenal;
+    // Si el ESP32 envía el estado, ese manda.
+    if (latest.deviceState case final state?) return state;
     final states = activeMetrics.map((m) => stateForMetric(m, latestFor(m.id)));
     if (states.contains(AlertState.alerta)) return AlertState.alerta;
     if (states.contains(AlertState.prealerta)) return AlertState.prealerta;
@@ -174,32 +210,314 @@ class _HomeScreenState extends State<HomeScreen> {
     return AlertState.normal;
   }
 
-  Widget _dashboard() => RefreshIndicator(
-        onRefresh: () async { if (source != null) await source!.probarConexion(); },
-        child: ListView(padding: const EdgeInsets.all(18), children: [
-          Text('ESTADO DEL SISTEMA', style: Theme.of(context).textTheme.labelSmall),
-          Text('Monitoreo en tiempo real', style: Theme.of(context).textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold)),
-          const SizedBox(height: 16),
-          Card(color: _stateColor(globalState).withValues(alpha: .14), child: ListTile(
-            leading: CircleAvatar(backgroundColor: _stateColor(globalState), child: Icon(globalState == AlertState.sinSenal ? Icons.signal_wifi_off : Icons.check, color: Colors.white)),
-            title: Text(globalState == AlertState.sinSenal ? 'Sin señal del sensor' : globalState.label, style: const TextStyle(fontWeight: FontWeight.bold)),
-            subtitle: Text(message.isNotEmpty ? message : 'Prealertas y alertas evaluadas por métrica'),
-          )),
-          const SizedBox(height: 12),
-          if (activeMetrics.isEmpty) const Card(child: ListTile(title: Text('No hay métricas activas.'), subtitle: Text('Activa una métrica desde Sensores / Métricas.'))),
-          ...activeMetrics.map(_metricCard),
-        ]),
-      );
+  // ============================ DASHBOARD ============================
 
-  Widget _metricCard(MetricConfig metric) {
-    final current = latestFor(metric.id);
-    final value = current?.values[metric.id];
-    return Card(child: Padding(padding: const EdgeInsets.all(16), child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-      Row(children: [_metricIcon(metric), const SizedBox(width: 8), Expanded(child: Text(metric.name, style: const TextStyle(fontWeight: FontWeight.bold))), Chip(label: Text(stateForMetric(metric, current).label))]),
-      const SizedBox(height: 8),
-      Text(value == null ? 'Sensor no conectado' : '${value.toStringAsFixed(2)} ${metric.unit}', style: Theme.of(context).textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.bold)),
-      Text(current == null ? 'Sin lecturas' : 'Última lectura: ${_format(current.timestamp)} · Tendencia ${_rate(metric).toStringAsFixed(2)} ${metric.unit}/min'),
-    ])));
+  MetricConfig? _metric(String id) => metrics.where((m) => m.id == id).firstOrNull;
+  double? _value(String id) => latestFor(id)?.values[id];
+
+  Widget _dashboard() {
+    final state = globalState;
+    final latest = readings.lastOrNull;
+    final theme = Theme.of(context);
+    return RefreshIndicator(
+      onRefresh: () async {
+        if (source != null) await source!.probarConexion();
+      },
+      child: ListView(padding: const EdgeInsets.fromLTRB(16, 12, 16, 24), children: [
+        Text('ESTADO DEL SISTEMA', style: theme.textTheme.labelSmall?.copyWith(letterSpacing: 1.2)),
+        Text('Monitoreo en tiempo real',
+            style: theme.textTheme.headlineSmall?.copyWith(fontWeight: FontWeight.bold)),
+        const SizedBox(height: 14),
+        _stateBanner(state),
+        const SizedBox(height: 14),
+        Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Expanded(child: _valueTile('humidity', max: 100, decimals: 0, note: 'Sensor capacitivo')),
+          const SizedBox(width: 12),
+          Expanded(child: _valueTile('inclination', max: 15, decimals: 1, note: 'Simulada por humedad')),
+        ]),
+        const SizedBox(height: 12),
+        _pressureCard(),
+        const SizedBox(height: 12),
+        _stateScale(state),
+        const SizedBox(height: 14),
+        Row(children: [
+          Icon(demo ? Icons.science : Icons.cloud_done, size: 16, color: theme.colorScheme.outline),
+          const SizedBox(width: 6),
+          Expanded(
+            child: Text(
+              latest == null
+                  ? 'Esperando datos de ${demo ? 'la demo' : 'Firebase'}...'
+                  : 'Última lectura: ${_formatTime(latest.timestamp)} · Fuente: ${demo ? 'modo demo' : 'Firebase'}',
+              style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.outline),
+            ),
+          ),
+        ]),
+      ]),
+    );
+  }
+
+  Widget _stateBanner(AlertState state) {
+    final color = _stateColor(state);
+    final (IconData icon, String detail) = switch (state) {
+      AlertState.normal => (Icons.verified_user, 'Condiciones estables. No se requiere ninguna acción.'),
+      AlertState.prealerta => (Icons.directions_run, 'El nivel freático está subiendo. Prepare la evacuación preventiva.'),
+      AlertState.alerta => (Icons.warning_rounded, 'Riesgo alto de deslizamiento. Evacúe la zona de inmediato.'),
+      AlertState.sinSenal => (
+          Icons.signal_wifi_off,
+          message.isNotEmpty ? message : 'No llegan datos del ESP32 desde hace más de 30 segundos.'
+        ),
+    };
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 400),
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(20),
+        boxShadow: [BoxShadow(color: color.withValues(alpha: .35), blurRadius: 14, offset: const Offset(0, 6))],
+      ),
+      child: Row(children: [
+        Container(
+          padding: const EdgeInsets.all(10),
+          decoration: BoxDecoration(color: Colors.white.withValues(alpha: .18), shape: BoxShape.circle),
+          child: Icon(icon, color: Colors.white, size: 36),
+        ),
+        const SizedBox(width: 16),
+        Expanded(
+          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+            Text('Estado de alerta',
+                style: TextStyle(color: Colors.white.withValues(alpha: .85), fontSize: 13, fontWeight: FontWeight.w600)),
+            const SizedBox(height: 2),
+            Text(state.label,
+                style: const TextStyle(color: Colors.white, fontSize: 26, fontWeight: FontWeight.w800, height: 1.1)),
+            const SizedBox(height: 6),
+            Text(detail, style: const TextStyle(color: Colors.white, fontSize: 13.5)),
+          ]),
+        ),
+      ]),
+    );
+  }
+
+  Widget _valueTile(String id, {required double max, required int decimals, String? note}) {
+    final metric = _metric(id);
+    if (metric == null) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    final reading = latestFor(id);
+    final value = reading?.values[id];
+    final state = stateForMetric(metric, reading);
+    final accent = state == AlertState.sinSenal ? Color(metric.colorValue) : _stateColor(state);
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            _metricIcon(metric),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(metric.name,
+                  maxLines: 2, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13.5)),
+            ),
+          ]),
+          const SizedBox(height: 10),
+          Text.rich(TextSpan(children: [
+            TextSpan(
+              text: value == null ? '--' : value.toStringAsFixed(decimals),
+              style: theme.textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w800),
+            ),
+            TextSpan(text: ' ${metric.unit}', style: theme.textTheme.titleMedium),
+          ])),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: value == null ? 0 : (value / max).clamp(0, 1).toDouble(),
+              minHeight: 6,
+              color: accent,
+              backgroundColor: accent.withValues(alpha: .15),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(children: [
+            Container(width: 8, height: 8, decoration: BoxDecoration(color: accent, shape: BoxShape.circle)),
+            const SizedBox(width: 6),
+            Expanded(child: Text(state.label, style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600))),
+          ]),
+          if (note != null)
+            Text(note, style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.outline)),
+        ]),
+      ),
+    );
+  }
+
+  /// Presión de poros con el recipiente de 25 cm y la fórmula u = γw · h.
+  Widget _pressureCard() {
+    final metric = _metric('pressure');
+    if (metric == null) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    final reading = latestFor('pressure');
+    final pressure = reading?.values['pressure'];
+    // Si no llega nivel_cm, se despeja de la presión: h = u / γw.
+    final level = _value('level') ?? (pressure == null ? null : pressure / gammaAguaKnM3 * 100);
+    final state = stateForMetric(metric, reading);
+    final accent = state == AlertState.sinSenal ? Color(metric.colorValue) : _stateColor(state);
+
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          _tank(level),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Row(children: [
+                _metricIcon(metric),
+                const SizedBox(width: 6),
+                const Expanded(child: Text('Presión de poros', style: TextStyle(fontWeight: FontWeight.bold))),
+              ]),
+              const SizedBox(height: 6),
+              Text.rich(TextSpan(children: [
+                TextSpan(
+                  text: pressure == null ? '--' : pressure.toStringAsFixed(2),
+                  style: theme.textTheme.headlineMedium?.copyWith(fontWeight: FontWeight.w800),
+                ),
+                TextSpan(text: ' kPa', style: theme.textTheme.titleMedium),
+              ])),
+              const SizedBox(height: 4),
+              Text(
+                level == null
+                    ? 'Nivel freático: --'
+                    : 'Nivel freático: ${level.toStringAsFixed(1)} de ${alturaRecipienteCm.toStringAsFixed(0)} cm',
+                style: theme.textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 4),
+              Row(children: [
+                Container(width: 8, height: 8, decoration: BoxDecoration(color: accent, shape: BoxShape.circle)),
+                const SizedBox(width: 6),
+                Text(state.label, style: theme.textTheme.bodySmall?.copyWith(fontWeight: FontWeight.w600)),
+              ]),
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHighest,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  const Text('u = γw · h', style: TextStyle(fontWeight: FontWeight.bold, fontFamily: 'monospace')),
+                  Text(
+                    level == null
+                        ? 'γw = 9,81 kN/m³ · h en metros'
+                        : '9,81 kN/m³ × ${(level / 100).toStringAsFixed(3)} m = ${presionPorosKpa(level).toStringAsFixed(2)} kPa',
+                    style: theme.textTheme.bodySmall?.copyWith(fontFamily: 'monospace'),
+                  ),
+                ]),
+              ),
+              const SizedBox(height: 6),
+              Text('Simulada por rangos de humedad',
+                  style: theme.textTheme.bodySmall?.copyWith(color: theme.colorScheme.outline)),
+            ]),
+          ),
+        ]),
+      ),
+    );
+  }
+
+  /// Recipiente de 25 cm con el agua a la altura h.
+  Widget _tank(double? levelCm) {
+    final theme = Theme.of(context);
+    final double fraction = levelCm == null ? 0.0 : (levelCm / alturaRecipienteCm).clamp(0.0, 1.0).toDouble();
+    const height = 150.0;
+    return Column(children: [
+      Text('${alturaRecipienteCm.toStringAsFixed(0)} cm', style: theme.textTheme.labelSmall),
+      const SizedBox(height: 4),
+      Container(
+        width: 62,
+        height: height,
+        decoration: BoxDecoration(
+          border: Border(
+            left: BorderSide(color: theme.colorScheme.outline, width: 2),
+            right: BorderSide(color: theme.colorScheme.outline, width: 2),
+            bottom: BorderSide(color: theme.colorScheme.outline, width: 2),
+          ),
+          borderRadius: const BorderRadius.vertical(bottom: Radius.circular(8)),
+        ),
+        child: ClipRRect(
+          borderRadius: const BorderRadius.vertical(bottom: Radius.circular(6)),
+          child: Stack(alignment: Alignment.bottomCenter, children: [
+            // Suelo de fondo
+            Container(color: const Color(0xff6d4c41).withValues(alpha: .25)),
+            AnimatedContainer(
+              duration: const Duration(milliseconds: 600),
+              curve: Curves.easeOut,
+              height: height * fraction,
+              color: const Color(0xff1e88e5).withValues(alpha: .75),
+            ),
+            Positioned.fill(
+              child: Center(
+                child: Text(
+                  levelCm == null ? '--' : '${levelCm.toStringAsFixed(0)} cm',
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                ),
+              ),
+            ),
+          ]),
+        ),
+      ),
+      const SizedBox(height: 4),
+      Text('h', style: theme.textTheme.labelSmall?.copyWith(fontStyle: FontStyle.italic)),
+    ]);
+  }
+
+  /// Escala de los tres estados con el actual resaltado.
+  Widget _stateScale(AlertState current) {
+    final theme = Theme.of(context);
+    Widget item(AlertState state, String range) {
+      final active = state == current;
+      final color = _stateColor(state);
+      return Expanded(
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 300),
+          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 6),
+          decoration: BoxDecoration(
+            color: active ? color : color.withValues(alpha: .10),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Column(children: [
+            Text(state.label,
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 12.5,
+                  color: active ? Colors.white : color,
+                )),
+            const SizedBox(height: 2),
+            Text(range,
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 11.5, color: active ? Colors.white : theme.colorScheme.onSurfaceVariant)),
+          ]),
+        ),
+      );
+    }
+
+    return Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const Text('Escala de alerta', style: TextStyle(fontWeight: FontWeight.bold)),
+          const SizedBox(height: 8),
+          Row(children: [
+            item(AlertState.normal, 'Humedad < 45 %\nh ≤ 12 cm'),
+            const SizedBox(width: 8),
+            item(AlertState.prealerta, 'Humedad 45–64 %\nh = 16 cm'),
+            const SizedBox(width: 8),
+            item(AlertState.alerta, 'Humedad ≥ 65 %\nh ≥ 20 cm'),
+          ]),
+        ]),
+      ),
+    );
   }
 
   Widget _charts() => ListView(padding: const EdgeInsets.all(18), children: [
@@ -215,7 +533,7 @@ class _HomeScreenState extends State<HomeScreen> {
               HorizontalLine(y: metric.alert, color: Colors.red, dashArray: [6, 4]),
             ]),
             lineBarsData: [LineChartBarData(isCurved: true, color: Color(metric.colorValue), spots: [
-              for (final r in readings.where((r) => r.values[metric.id] != null).take(200))
+              for (final r in _lastN(readings.where((r) => r.values[metric.id] != null).toList(), 200))
                 FlSpot(r.timestamp.millisecondsSinceEpoch.toDouble(), r.values[metric.id]!),
             ])],
           ))),
@@ -280,6 +598,7 @@ class _HomeScreenState extends State<HomeScreen> {
       ]);
 
   AlertState _readingState(Reading reading) {
+    if (reading.deviceState case final state?) return state;
     final states = activeMetrics.where((m) => reading.values[m.id] != null).map((m) => stateFor(reading.values[m.id]!, m.prealert, m.alert, rises: m.rises));
     if (states.contains(AlertState.alerta)) return AlertState.alerta;
     if (states.contains(AlertState.prealerta)) return AlertState.prealerta;
@@ -292,11 +611,21 @@ class _HomeScreenState extends State<HomeScreen> {
     final minutes = b.timestamp.difference(a.timestamp).inMilliseconds / 60000;
     return minutes <= 0 ? 0 : (b.values[metric.id]! - a.values[metric.id]!) / minutes;
   }
-  Color _stateColor(AlertState state) => switch (state) { AlertState.alerta => Colors.red, AlertState.prealerta => Colors.orange, AlertState.sinSenal => Colors.grey, AlertState.normal => Colors.green };
-  Widget _metricIcon(MetricConfig metric) => Icon(
-        metric.id == 'pressure' ? Icons.speed : Icons.water_drop,
-        color: Color(metric.colorValue),
-      );
+  Color _stateColor(AlertState state) => switch (state) {
+        AlertState.alerta => const Color(0xffc62828),
+        AlertState.prealerta => const Color(0xffef6c00),
+        AlertState.sinSenal => const Color(0xff616161),
+        AlertState.normal => const Color(0xff2e7d32),
+      };
+  IconData _iconFor(String metricId) => switch (metricId) {
+        'pressure' => Icons.speed,
+        'level' => Icons.waves,
+        'inclination' => Icons.terrain,
+        _ => Icons.water_drop,
+      };
+  Widget _metricIcon(MetricConfig metric) => Icon(_iconFor(metric.id), color: Color(metric.colorValue));
+  List<T> _lastN<T>(List<T> items, int n) => items.length <= n ? items : items.sublist(items.length - n);
+  String _formatTime(DateTime d) => '${d.hour.toString().padLeft(2, '0')}:${d.minute.toString().padLeft(2, '0')}:${d.second.toString().padLeft(2, '0')}';
   String _format(DateTime date) => '${date.day.toString().padLeft(2, '0')}/${date.month.toString().padLeft(2, '0')} ${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}';
 
   Future<void> _testConnection(ConnectionProfile profile) async {
@@ -409,9 +738,9 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 }
 
+// firstOrNull y lastOrNull ya vienen en dart:core (Dart 3); definirlos aquí
+// otra vez provoca un conflicto de extensiones.
 extension<T> on Iterable<T> {
-  T? get firstOrNull => isEmpty ? null : first;
-  T? get lastOrNull => isEmpty ? null : last;
   T? lastWhereOrNull(bool Function(T) test) {
     for (final item in toList().reversed) { if (test(item)) return item; }
     return null;
